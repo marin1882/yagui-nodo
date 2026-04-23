@@ -1,0 +1,7 @@
+tunnel: 85bb0790-fc47-4e36-bf16-9e9297d83592
+credentials-file: /home/marin/.cloudflared/85bb0790-fc47-4e36-bf16-9e9297d83592.json
+
+ingress:
+  - hostname: nodo1.xn--yagi-2ra.com
+    service: http://localhost:3000
+  - service: http_status:404
