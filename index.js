@@ -1,6 +1,8 @@
 const express  = require("express");
 const Database = require("better-sqlite3");
 const path     = require("path");
+const fs       = require("fs");
+const crypto   = require("crypto");
 
 const app = express();
 const db  = new Database(path.join(__dirname, "nodo.db"));
@@ -20,12 +22,29 @@ db.exec(`
   );
 `);
 
+// ── Inventario JSON ───────────────────────────────────────────────────────────
+
+const DATA_DIR = path.join(__dirname, "data");
+const INV_PATH = path.join(DATA_DIR, "inventario.json");
+
+function leerInventario() {
+  if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
+  if (!fs.existsSync(INV_PATH)) fs.writeFileSync(INV_PATH, "[]", "utf8");
+  try { return JSON.parse(fs.readFileSync(INV_PATH, "utf8")); }
+  catch { return []; }
+}
+
+function guardarInventario(productos) {
+  if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
+  fs.writeFileSync(INV_PATH, JSON.stringify(productos, null, 2), "utf8");
+}
+
 // ── Middleware ────────────────────────────────────────────────────────────────
 
 app.use(express.json());
 app.use((req, res, next) => {
   res.setHeader("Access-Control-Allow-Origin",  "*");
-  res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+  res.setHeader("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS");
   res.setHeader("Access-Control-Allow-Headers", "Content-Type");
   if (req.method === "OPTIONS") return res.sendStatus(204);
   next();
@@ -36,6 +55,172 @@ app.use((req, res, next) => {
 app.get("/health", (req, res) => {
   const { total } = db.prepare("SELECT COUNT(*) AS total FROM productos").get();
   res.json({ status: "ok", productos: total });
+});
+
+// ── GET /inventario/stats ─────────────────────────────────────────────────────
+
+app.get("/inventario/stats", (req, res) => {
+  const productos = leerInventario();
+  const ultima = productos.length > 0
+    ? productos.reduce((a, b) => a.actualizado_at > b.actualizado_at ? a : b).actualizado_at
+    : null;
+  res.json({
+    total:                productos.length,
+    ultima_actualizacion: ultima,
+    archivo:              INV_PATH,
+  });
+});
+
+// ── GET /inventario ───────────────────────────────────────────────────────────
+
+app.get("/inventario", (req, res) => {
+  res.json(leerInventario());
+});
+
+// ── GET /inventario/:id ───────────────────────────────────────────────────────
+
+app.get("/inventario/:id", (req, res) => {
+  const p = leerInventario().find(x => x.id === req.params.id);
+  if (!p) return res.status(404).json({ error: "no encontrado" });
+  res.json(p);
+});
+
+// ── POST /inventario/bulk ─────────────────────────────────────────────────────
+
+app.post("/inventario/bulk", (req, res) => {
+  const body = req.body;
+  const items = Array.isArray(body) ? body : (body?.productos ?? []);
+  if (!Array.isArray(items)) return res.status(400).json({ error: "array requerido" });
+
+  const productos = leerInventario();
+  let insertados = 0, actualizados = 0;
+
+  for (const item of items) {
+    const barcode = item.codigo_barras || item.barcode || "";
+    const idx = barcode
+      ? productos.findIndex(x => x.codigo_barras === barcode)
+      : -1;
+
+    const base = {
+      nombre:        item.nombre      ?? "Sin nombre",
+      precio:        item.precio      ?? 0,
+      stock:         item.stock       ?? item.unidades   ?? 0,
+      codigo_barras: barcode,
+      categoria:     item.categoria   ?? "",
+      imagen_url:    item.imagen_url  ?? item.foto_url   ?? "",
+      actualizado_at: new Date().toISOString(),
+    };
+
+    if (idx >= 0) {
+      productos[idx] = { ...productos[idx], ...base };
+      actualizados++;
+    } else {
+      productos.push({ id: crypto.randomUUID(), ...base });
+      insertados++;
+    }
+  }
+
+  guardarInventario(productos);
+  // Sync también a SQLite para el sistema de IA
+  for (const item of items) {
+    const barcode = item.codigo_barras || item.barcode || "";
+    if (barcode) {
+      upsert.run({
+        barcode,
+        nombre:    item.nombre    ?? "Sin nombre",
+        marca:     item.marca     ?? "",
+        categoria: item.categoria ?? "",
+        foto_url:  item.imagen_url ?? item.foto_url ?? "",
+        precio:    item.precio    ?? 0,
+        unidades:  item.stock     ?? item.unidades  ?? 0,
+      });
+    }
+  }
+
+  res.json({ ok: true, insertados, actualizados });
+});
+
+// ── POST /inventario ──────────────────────────────────────────────────────────
+
+app.post("/inventario", (req, res) => {
+  const { nombre, precio, stock, codigo_barras, categoria, imagen_url } = req.body ?? {};
+  if (!nombre) return res.status(400).json({ error: "nombre requerido" });
+
+  const nuevo = {
+    id:            crypto.randomUUID(),
+    nombre,
+    precio:        precio        ?? 0,
+    stock:         stock         ?? 0,
+    codigo_barras: codigo_barras ?? "",
+    categoria:     categoria     ?? "",
+    imagen_url:    imagen_url    ?? "",
+    actualizado_at: new Date().toISOString(),
+  };
+
+  const productos = leerInventario();
+  productos.push(nuevo);
+  guardarInventario(productos);
+
+  // Sync a SQLite
+  if (codigo_barras) {
+    upsert.run({
+      barcode:   codigo_barras,
+      nombre,
+      marca:     "",
+      categoria: categoria ?? "",
+      foto_url:  imagen_url ?? "",
+      precio:    precio     ?? 0,
+      unidades:  stock      ?? 0,
+    });
+  }
+
+  console.log(`[inventario] POST — ${nombre}`);
+  res.status(201).json(nuevo);
+});
+
+// ── PUT /inventario/:id ───────────────────────────────────────────────────────
+
+app.put("/inventario/:id", (req, res) => {
+  const productos = leerInventario();
+  const idx = productos.findIndex(x => x.id === req.params.id);
+  if (idx === -1) return res.status(404).json({ error: "no encontrado" });
+
+  const actualizado = {
+    ...productos[idx],
+    ...req.body,
+    id:             req.params.id,
+    actualizado_at: new Date().toISOString(),
+  };
+  productos[idx] = actualizado;
+  guardarInventario(productos);
+
+  // Sync a SQLite si tiene barcode
+  if (actualizado.codigo_barras) {
+    upsert.run({
+      barcode:   actualizado.codigo_barras,
+      nombre:    actualizado.nombre,
+      marca:     "",
+      categoria: actualizado.categoria ?? "",
+      foto_url:  actualizado.imagen_url ?? "",
+      precio:    actualizado.precio    ?? 0,
+      unidades:  actualizado.stock     ?? 0,
+    });
+  }
+
+  console.log(`[inventario] PUT ${req.params.id}`);
+  res.json(actualizado);
+});
+
+// ── DELETE /inventario/:id ────────────────────────────────────────────────────
+
+app.delete("/inventario/:id", (req, res) => {
+  const productos = leerInventario();
+  const idx = productos.findIndex(x => x.id === req.params.id);
+  if (idx === -1) return res.status(404).json({ error: "no encontrado" });
+  const [eliminado] = productos.splice(idx, 1);
+  guardarInventario(productos);
+  console.log(`[inventario] DELETE ${req.params.id} — ${eliminado.nombre}`);
+  res.json({ ok: true });
 });
 
 // ── POST /sync ────────────────────────────────────────────────────────────────
@@ -68,13 +253,28 @@ app.post("/sync", (req, res) => {
     unidades:  unidades  ?? null,
   });
 
+  // También actualizar inventario.json
+  const productos = leerInventario();
+  const idx = productos.findIndex(x => x.codigo_barras === barcode);
+  const entry = {
+    nombre, precio: precio ?? 0, stock: unidades ?? 0,
+    codigo_barras: barcode, categoria: categoria ?? "",
+    imagen_url: foto_url ?? "", actualizado_at: new Date().toISOString(),
+  };
+  if (idx >= 0) {
+    productos[idx] = { ...productos[idx], ...entry };
+  } else {
+    productos.push({ id: crypto.randomUUID(), ...entry });
+  }
+  guardarInventario(productos);
+
   res.json({ ok: true });
 });
 
 // ── POST /sync-all ────────────────────────────────────────────────────────────
 
-const upsertMany = db.transaction((productos) => {
-  for (const p of productos) {
+const upsertMany = db.transaction((prods) => {
+  for (const p of prods) {
     upsert.run({
       barcode:   p.barcode,
       nombre:    p.nombre    ?? "Sin nombre",
@@ -96,7 +296,6 @@ app.post("/sync-all", (req, res) => {
   try {
     if (productos.length === 0) {
       db.prepare("DELETE FROM productos").run();
-      console.log("[sync-all] inventario limpiado");
       return res.json({ ok: true, sincronizados: 0 });
     }
     upsertMany(productos);
@@ -111,40 +310,23 @@ app.post("/sync-all", (req, res) => {
 app.post("/query", (req, res) => {
   const { query_type, barcode } = req.body ?? {};
   console.log(`[query] ${query_type} — ${barcode ?? "n/a"}`);
-
   if (!query_type) return res.status(400).json({ error: "query_type requerido" });
 
   if (query_type === "product") {
-    if (!barcode) return res.status(400).json({ error: "barcode requerido para query_type=product" });
-
+    if (!barcode) return res.status(400).json({ error: "barcode requerido" });
     const row = db.prepare("SELECT * FROM productos WHERE barcode = ?").get(barcode);
-
     if (!row) return res.json({ found: false });
-
-    return res.json({
-      found:     true,
-      barcode:   row.barcode,
-      nombre:    row.nombre,
-      marca:     row.marca,
-      categoria: row.categoria,
-      foto_url:  row.foto_url,
-      precio:    row.precio,
-      unidades:  row.unidades,
-      last_seen: row.last_seen,
-    });
+    return res.json({ found: true, ...row });
   }
 
   if (query_type === "search") {
     const { query_text } = req.body;
-    console.log(`[query] search — "${query_text}"`);
-    if (!query_text) return res.status(400).json({ error: "query_text requerido para query_type=search" });
-
+    if (!query_text) return res.status(400).json({ error: "query_text requerido" });
     const rows = db.prepare(`
       SELECT * FROM productos
       WHERE nombre LIKE ? OR marca LIKE ? OR categoria LIKE ?
       ORDER BY last_seen DESC LIMIT 5
     `).all(`%${query_text}%`, `%${query_text}%`, `%${query_text}%`);
-
     return res.json({ found: rows.length > 0, resultados: rows });
   }
 
