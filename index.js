@@ -4,6 +4,12 @@ const path     = require("path");
 const fs       = require("fs");
 const crypto   = require("crypto");
 
+// ── Variables de entorno ──────────────────────────────────────────────────────
+const TUNNEL_URL    = process.env.TUNNEL_URL    || "";
+const SUPABASE_URL  = process.env.SUPABASE_URL  || "https://lbozfbvenchyafyihyso.supabase.co";
+const SUPABASE_ANON = process.env.SUPABASE_ANON_KEY || "";
+const NODO_HOST     = TUNNEL_URL.replace(/^https?:\/\//, "").split("/")[0] || "nodo-local";
+
 const app = express();
 const db  = new Database(path.join(__dirname, "nodo.db"));
 
@@ -305,6 +311,23 @@ app.post("/sync-all", (req, res) => {
   }
 });
 
+// ── GET /buscar?q=xxx ─────────────────────────────────────────────────────────
+
+app.get("/buscar", (req, res) => {
+  const q = (req.query.q || "").toLowerCase().trim();
+  if (!q) return res.json({ nodo: NODO_HOST, resultados: [], total: 0 });
+
+  const productos = leerInventario();
+  const resultados = productos
+    .filter(p =>
+      (p.nombre    || "").toLowerCase().includes(q) ||
+      (p.categoria || "").toLowerCase().includes(q)
+    )
+    .map(({ nombre, precio, stock, categoria }) => ({ nombre, precio, stock, categoria }));
+
+  res.json({ nodo: NODO_HOST, resultados, total: resultados.length });
+});
+
 // ── POST /query ───────────────────────────────────────────────────────────────
 
 app.post("/query", (req, res) => {
@@ -333,11 +356,39 @@ app.post("/query", (req, res) => {
   res.status(400).json({ error: "query_type no soportado" });
 });
 
+// ── Heartbeat a Supabase ──────────────────────────────────────────────────────
+
+async function heartbeat() {
+  if (!TUNNEL_URL || !SUPABASE_ANON) return;
+  try {
+    const r = await fetch(
+      `${SUPABASE_URL}/rest/v1/tiendas?tunnel_url=eq.${encodeURIComponent(TUNNEL_URL)}`,
+      {
+        method:  "PATCH",
+        headers: {
+          "apikey":        SUPABASE_ANON,
+          "Content-Type":  "application/json",
+          "Prefer":        "return=minimal",
+        },
+        body: JSON.stringify({ last_seen: new Date().toISOString() }),
+      }
+    );
+    if (!r.ok) console.error(`[heartbeat] HTTP ${r.status}`);
+    else       console.log(`[heartbeat] OK — ${new Date().toLocaleTimeString()}`);
+  } catch (e) {
+    console.error("[heartbeat] error:", e.message);
+  }
+}
+
 // ── Start ─────────────────────────────────────────────────────────────────────
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`nodo-server escuchando en http://localhost:${PORT}`);
+
+  // Heartbeat a Supabase cada 60 s
+  heartbeat();
+  setInterval(heartbeat, 60_000);
 
   // Comprobar actualizaciones 5 s después de arrancar, y luego cada 24 h
   setTimeout(checkForUpdates, 5_000);
