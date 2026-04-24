@@ -336,4 +336,57 @@ app.post("/query", (req, res) => {
 // ── Start ─────────────────────────────────────────────────────────────────────
 
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, () => console.log(`nodo-server escuchando en http://localhost:${PORT}`));
+app.listen(PORT, () => {
+  console.log(`nodo-server escuchando en http://localhost:${PORT}`);
+
+  // Comprobar actualizaciones 5 s después de arrancar, y luego cada 24 h
+  setTimeout(checkForUpdates, 5_000);
+  setInterval(checkForUpdates, 24 * 60 * 60 * 1_000);
+});
+
+// ── Auto-actualización desde GitHub ──────────────────────────────────────────
+
+const { execSync } = require("child_process");
+const REPO_URL = "https://github.com/marin1882/yagui-nodo.git";
+
+function checkForUpdates() {
+  try {
+    const gitDir = path.join(__dirname, ".git");
+
+    // Si el directorio no es un repo git (instalado via ZIP), inicializarlo
+    if (!fs.existsSync(gitDir)) {
+      console.log("[update] Inicializando repo git para auto-actualizaciones...");
+      execSync("git init", { cwd: __dirname, stdio: "ignore" });
+      execSync(`git remote add origin ${REPO_URL}`, { cwd: __dirname, stdio: "ignore" });
+      execSync("git fetch origin master --depth=1", { cwd: __dirname, stdio: "ignore" });
+      // Marcar el estado actual como origin/master sin reemplazar archivos de datos
+      execSync("git reset --hard origin/master", { cwd: __dirname, stdio: "ignore" });
+      console.log("[update] Repo git inicializado. Próxima comprobación en 24 h.");
+      return;
+    }
+
+    // Obtener SHA actual
+    const before = execSync("git rev-parse HEAD", { cwd: __dirname }).toString().trim();
+
+    // Descargar cambios de origin
+    execSync("git fetch origin master --depth=1", { cwd: __dirname, stdio: "pipe" });
+
+    // SHA en origin
+    const after = execSync("git rev-parse origin/master", { cwd: __dirname }).toString().trim();
+
+    if (before === after) {
+      console.log("[update] Sin cambios en GitHub.");
+      return;
+    }
+
+    console.log(`[update] Nueva versión: ${before.slice(0, 7)} → ${after.slice(0, 7)}`);
+    execSync("git reset --hard origin/master", { cwd: __dirname, stdio: "inherit" });
+    execSync("npm install --omit=dev",         { cwd: __dirname, stdio: "inherit" });
+    console.log("[update] Actualizado. Reiniciando proceso...");
+    process.exit(0); // yagui-desktop lo relanzará automáticamente
+
+  } catch (e) {
+    // Git no disponible o sin red — continuar sin actualizar
+    console.error("[update] No disponible:", e.message?.split("\n")[0]);
+  }
+}
