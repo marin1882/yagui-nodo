@@ -5,10 +5,11 @@ const fs       = require("fs");
 const crypto   = require("crypto");
 
 // ── Variables de entorno ──────────────────────────────────────────────────────
-const TUNNEL_URL    = process.env.TUNNEL_URL    || "";
-const SUPABASE_URL  = process.env.SUPABASE_URL  || "https://lbozfbvenchyafyihyso.supabase.co";
-const SUPABASE_ANON = process.env.SUPABASE_ANON_KEY || "";
-const NODO_HOST     = TUNNEL_URL.replace(/^https?:\/\//, "").split("/")[0] || "nodo-local";
+const TUNNEL_URL      = process.env.TUNNEL_URL      || "";
+const SUPABASE_URL    = process.env.SUPABASE_URL    || "https://lbozfbvenchyafyihyso.supabase.co";
+const SUPABASE_ANON   = process.env.SUPABASE_ANON_KEY || "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Imxib3pmYnZlbmNoeWFmeWloeXNvIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzYxNzM5NTEsImV4cCI6MjA5MTc0OTk1MX0.4RwMzeCPHKHX6B4WGH8S3yQHXFwmqKzCo6u8sL37ddQ";
+const INVENTORY_PATH  = process.env.INVENTORY_PATH  || "";
+const NODO_HOST       = TUNNEL_URL.replace(/^https?:\/\//, "").split("/")[0] || "nodo-local";
 
 const app = express();
 const db  = new Database(path.join(__dirname, "nodo.db"));
@@ -313,12 +314,67 @@ app.post("/sync-all", (req, res) => {
 
 // ── GET /buscar?q=xxx ─────────────────────────────────────────────────────────
 
+/** Lee CSVs y inventario.json del INVENTORY_PATH del usuario */
+function leerProductosExternos() {
+  if (!INVENTORY_PATH || !fs.existsSync(INVENTORY_PATH)) return [];
+  const productos = [];
+
+  // inventario.json en la carpeta del usuario
+  const jsonPath = path.join(INVENTORY_PATH, "inventario.json");
+  if (fs.existsSync(jsonPath)) {
+    try {
+      const data = JSON.parse(fs.readFileSync(jsonPath, "utf8"));
+      if (Array.isArray(data)) productos.push(...data);
+    } catch {}
+  }
+
+  // CSVs en la carpeta del usuario
+  try {
+    const archivos = fs.readdirSync(INVENTORY_PATH).filter(f => f.toLowerCase().endsWith(".csv"));
+    for (const archivo of archivos) {
+      const filas = parsearCSV(path.join(INVENTORY_PATH, archivo));
+      productos.push(...filas);
+    }
+  } catch {}
+
+  return productos;
+}
+
+/** Parser CSV mínimo sin dependencias externas */
+function parsearCSV(filePath) {
+  try {
+    const lines = fs.readFileSync(filePath, "utf8").trim().split("\n");
+    if (lines.length < 2) return [];
+    const headers = lines[0].split(",").map(h => h.trim().toLowerCase().replace(/^"|"$/g, ""));
+    return lines.slice(1).map(line => {
+      const vals = line.split(",");
+      const row  = Object.fromEntries(headers.map((h, i) => [h, (vals[i] || "").trim().replace(/^"|"$/g, "")]));
+      return {
+        nombre:        row.nombre    || row.name     || "",
+        precio:        parseFloat(row.precio || row.price || 0) || 0,
+        stock:         parseInt(row.stock    || row.unidades || row.cantidad || 0) || 0,
+        categoria:     row.categoria || row.category || "",
+        codigo_barras: row.codigo_barras || row.barcode || "",
+      };
+    }).filter(r => r.nombre);
+  } catch { return []; }
+}
+
 app.get("/buscar", (req, res) => {
   const q = (req.query.q || "").toLowerCase().trim();
   if (!q) return res.json({ nodo: NODO_HOST, resultados: [], total: 0 });
 
-  const productos = leerInventario();
-  const resultados = productos
+  const locales = leerInventario();
+  const externos = leerProductosExternos();
+
+  // Deduplicar por codigo_barras — locales tienen prioridad
+  const barcodesLocales = new Set(locales.map(p => p.codigo_barras).filter(Boolean));
+  const todos = [
+    ...locales,
+    ...externos.filter(p => !p.codigo_barras || !barcodesLocales.has(p.codigo_barras)),
+  ];
+
+  const resultados = todos
     .filter(p =>
       (p.nombre    || "").toLowerCase().includes(q) ||
       (p.categoria || "").toLowerCase().includes(q)
@@ -367,6 +423,7 @@ async function heartbeat() {
         method:  "PATCH",
         headers: {
           "apikey":        SUPABASE_ANON,
+          "Authorization": `Bearer ${SUPABASE_ANON}`,
           "Content-Type":  "application/json",
           "Prefer":        "return=minimal",
         },
